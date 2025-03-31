@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  mongodb:
+    image: mongo:latest
+    container_name: rag-app-mongodb
+    restart: always
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_DATABASE: rag-agents
+    volumes:
+      - mongo-data:/data/db
+    networks:
+      - rag-network
+
+  # Opcional: MongoDB Express (interface web para gerenciar o MongoDB)
+  mongo-express:
+    image: mongo-express:latest
+    container_name: rag-app-mongo-express
+    restart: always
+    ports:
+      - "8081:8081"
+    environment:
+      ME_CONFIG_MONGODB_SERVER: mongodb
+      ME_CONFIG_BASICAUTH_USERNAME: admin
+      ME_CONFIG_BASICAUTH_PASSWORD: senha123
+      ME_CONFIG_MONGODB_URL: mongodb://mongodb:27017/
+    depends_on:
+      - mongodb
+    networks:
+      - rag-network
+
+networks:
+  rag-network:
+    driver: bridge
+
+volumes:
+  mongo-data: 
