@@ -9,14 +9,15 @@ interface MongooseCache {
 }
 
 // Cache da conexão no ambiente de desenvolvimento
-let cached: MongooseCache;
+// @ts-ignore
+const cached: MongooseCache = global.mongoose || { conn: null, promise: null };
 
 // Verificar se a conexão já existe no objeto global
-if (!(global as any).mongoose) {
-  (global as any).mongoose = { conn: null, promise: null };
+// @ts-ignore
+if (!global.mongoose) {
+  // @ts-ignore
+  global.mongoose = { conn: null, promise: null };
 }
-
-cached = (global as any).mongoose;
 
 async function connectDB() {
   if (cached.conn) {

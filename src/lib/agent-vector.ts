@@ -1,19 +1,10 @@
 import { FaissStore } from "@langchain/community/vectorstores/faiss";
 import { OpenAIEmbeddings } from "@langchain/openai";
 import { Document } from "langchain/document";
-import fs from 'fs';
-import path from 'path';
 import AgentDocument from '@/models/AgentDocument';
 import mongoose from 'mongoose';
 import connectDB from './mongodb';
-
-// Configurações para salvar em disco
-const VECTOR_STORE_DIR = path.join(process.cwd(), 'vector-store');
-
-// Garantir que o diretório base exista
-if (!fs.existsSync(VECTOR_STORE_DIR)) {
-  fs.mkdirSync(VECTOR_STORE_DIR, { recursive: true });
-}
+import { GridFSBucket, Db } from 'mongodb';
 
 // Classe para gerenciar o armazenamento de vetores específicos para cada agente
 export class AgentVectorStore {
@@ -23,13 +14,76 @@ export class AgentVectorStore {
     modelName: "text-embedding-ada-002",
   });
   
-  // Obter o diretório específico para o agente
-  private static getAgentDir(agentId: string): string {
-    const agentDir = path.join(VECTOR_STORE_DIR, agentId);
-    if (!fs.existsSync(agentDir)) {
-      fs.mkdirSync(agentDir, { recursive: true });
+  // Obter o bucket GridFS para um agente específico
+  private static async getGridFSBucket(agentId: string): Promise<GridFSBucket> {
+    await connectDB();
+    const db = mongoose.connection.db as Db;
+    return new GridFSBucket(db, { bucketName: `agent_${agentId}_vectors` });
+  }
+  
+  // Salvar vetor no GridFS
+  private static async saveVectorToGridFS(agentId: string, vectorStore: FaissStore): Promise<void> {
+    const bucket = await this.getGridFSBucket(agentId);
+    
+    // Salvar o índice FAISS
+    const indexBuffer = Buffer.from(JSON.stringify(vectorStore));
+    const indexStream = bucket.openUploadStream('faiss.index');
+    indexStream.write(indexBuffer);
+    await new Promise<void>((resolve, reject) => {
+      indexStream.end(() => resolve());
+      indexStream.on('error', reject);
+    });
+    
+    // Salvar o docstore
+    const docstoreBuffer = Buffer.from(JSON.stringify(vectorStore.docstore));
+    const docstoreStream = bucket.openUploadStream('docstore.json');
+    docstoreStream.write(docstoreBuffer);
+    await new Promise<void>((resolve, reject) => {
+      docstoreStream.end(() => resolve());
+      docstoreStream.on('error', reject);
+    });
+  }
+  
+  // Carregar vetor do GridFS
+  private static async loadVectorFromGridFS(agentId: string): Promise<FaissStore | null> {
+    const bucket = await this.getGridFSBucket(agentId);
+    
+    try {
+      // Verificar se existem arquivos
+      const files = await bucket.find({}).toArray();
+      if (files.length === 0) return null;
+      
+      // Carregar o índice FAISS
+      const indexStream = bucket.openDownloadStreamByName('faiss.index');
+      const indexBuffer = await new Promise<Buffer>((resolve, reject) => {
+        const chunks: Buffer[] = [];
+        indexStream.on('data', chunk => chunks.push(chunk));
+        indexStream.on('end', () => resolve(Buffer.concat(chunks)));
+        indexStream.on('error', reject);
+      });
+      
+      // Carregar o docstore
+      const docstoreStream = bucket.openDownloadStreamByName('docstore.json');
+      const docstoreBuffer = await new Promise<Buffer>((resolve, reject) => {
+        const chunks: Buffer[] = [];
+        docstoreStream.on('data', chunk => chunks.push(chunk));
+        docstoreStream.on('end', () => resolve(Buffer.concat(chunks)));
+        docstoreStream.on('error', reject);
+      });
+      
+      const docstore = JSON.parse(docstoreBuffer.toString());
+      const vectorData = JSON.parse(indexBuffer.toString());
+      
+      // Criar o vetor
+      const store = await FaissStore.fromDocuments([], this.embeddingModel);
+      Object.assign(store, vectorData);
+      store.docstore = docstore;
+      
+      return store;
+    } catch (error) {
+      console.error(`Erro ao carregar vetor do GridFS para o agente ${agentId}:`, error);
+      return null;
     }
-    return agentDir;
   }
   
   // Obter uma instância do vetor para um agente específico
@@ -43,24 +97,14 @@ export class AgentVectorStore {
       return this.instances.get(agentId)!;
     }
     
-    const agentDir = this.getAgentDir(agentId);
-    
-    // Verificar se existe um índice FAISS salvo em disco para este agente
-    if (fs.existsSync(path.join(agentDir, 'faiss.index'))) {
-      try {
-        console.log(`Carregando índice FAISS do agente ${agentId}...`);
-        const store = await FaissStore.load(
-          agentDir,
-          this.embeddingModel
-        );
-        this.instances.set(agentId, store);
-        return store;
-      } catch (error) {
-        console.error(`Erro ao carregar FAISS do agente ${agentId}:`, error);
-      }
+    // Tentar carregar do GridFS
+    const storedVector = await this.loadVectorFromGridFS(agentId);
+    if (storedVector) {
+      this.instances.set(agentId, storedVector);
+      return storedVector;
     }
     
-    // Se não existir ou houver erro, criar um novo índice vazio
+    // Se não existir, criar um novo índice vazio
     console.log(`Criando novo índice FAISS para o agente ${agentId}...`);
     const store = await FaissStore.fromDocuments(
       [], // Começar com documentos vazios
@@ -82,9 +126,8 @@ export class AgentVectorStore {
     // Adicionar documentos ao índice FAISS
     await vectorStore.addDocuments(documents);
     
-    // Salvar o índice FAISS em disco
-    const agentDir = this.getAgentDir(agentId);
-    await vectorStore.save(agentDir);
+    // Salvar no GridFS
+    await this.saveVectorToGridFS(agentId, vectorStore);
     
     console.log(`${documents.length} documentos adicionados com sucesso ao agente ${agentId}.`);
   }
@@ -104,18 +147,8 @@ export class AgentVectorStore {
         return [];
       }
       
-      // Executar a busca por similaridade
-      const results = await vectorStore.similaritySearch(query, k);
-      
-      console.log(`Encontrados ${results.length} documentos similares para o agente ${agentId} de um total de ${allDocuments.length}.`);
-      results.forEach((doc, i) => {
-        console.log(`Documento ${i+1}: ID=${doc.metadata?.id || 'desconhecido'}, Início: ${doc.pageContent.substring(0, 50)}...`);
-      });
-      
-      // Se não encontrou resultados mas há documentos disponíveis, tente forçar a recuperação
-      if (results.length === 0 && allDocuments.length > 0) {
-        console.log(`Nenhum documento similar encontrado. Tentando forçar recuperação de todos os documentos disponíveis.`);
-        
+      // Se não há instância com documentos, recriar a partir do banco
+      if (!this.instances.has(agentId)) {
         // Converter os documentos do MongoDB para o formato LangChain Document
         const documents = allDocuments.map(doc => new Document({
           pageContent: doc.content,
@@ -126,9 +159,16 @@ export class AgentVectorStore {
           }
         }));
         
-        // Limitar à quantidade solicitada
-        return documents.slice(0, k);
+        await this.addDocuments(agentId, documents);
       }
+      
+      // Executar a busca por similaridade
+      const results = await vectorStore.similaritySearch(query, k);
+      
+      console.log(`Encontrados ${results.length} documentos similares para o agente ${agentId}.`);
+      results.forEach((doc, i) => {
+        console.log(`Documento ${i+1}: ID=${doc.metadata?.id || 'desconhecido'}, Início: ${doc.pageContent.substring(0, 50)}...`);
+      });
       
       return results;
     } catch (error) {
@@ -139,28 +179,18 @@ export class AgentVectorStore {
   
   // Limpar documentos de um agente específico
   static async clearAgentDocuments(agentId: string): Promise<void> {
-    const agentDir = this.getAgentDir(agentId);
+    const bucket = await this.getGridFSBucket(agentId);
+    
+    // Remover arquivos do GridFS
+    await bucket.drop();
     
     // Remover a instância da memória
     this.instances.delete(agentId);
     
-    // Remover arquivos do FAISS
-    try {
-      if (fs.existsSync(path.join(agentDir, 'faiss.index'))) {
-        fs.unlinkSync(path.join(agentDir, 'faiss.index'));
-      }
-      if (fs.existsSync(path.join(agentDir, 'docstore.json'))) {
-        fs.unlinkSync(path.join(agentDir, 'docstore.json'));
-      }
-      
-      // Criar um novo índice vazio
-      await this.getInstance(agentId);
-      
-      console.log(`Documentos do agente ${agentId} removidos com sucesso.`);
-    } catch (error) {
-      console.error(`Erro ao limpar documentos do agente ${agentId}:`, error);
-      throw error;
-    }
+    // Criar um novo índice vazio
+    await this.getInstance(agentId);
+    
+    console.log(`Documentos do agente ${agentId} removidos com sucesso.`);
   }
   
   // Carregar documentos do MongoDB para o vetor
